@@ -64,38 +64,13 @@ HIST_CSV = get_env("HIST_CSV", os.path.join(ASSETS_DIR, "data_history_for_predic
 
 MODEL_PATH = os.path.join(PATH_PKL, MODEL_FILENAME)
 FEATURES_PATH = os.path.join(PATH_PKL, FEATURES_FILENAME)
+FEATURES: List[str] = joblib.load(FEATURES_PATH)
 
 logger = logging.getLogger("unitsold_api")
 
 # -------------------------
 # Feature engineering placeholders 
 # -------------------------
-
-def create_time_features(df: pd.DataFrame) -> pd.DataFrame:
-    dt = pd.to_datetime(df["log_date"])
-    df["year"] = dt.dt.year
-    df["month"] = dt.dt.month
-    df["day"] = dt.dt.day
-    df["weekday"] = dt.dt.weekday
-    df["dayofyear"] = dt.dt.dayofyear
-    df["is_weekend"] = (df["weekday"] >= 5).astype(int)
-    return df
-
-def create_lagged_features(df: pd.DataFrame, lag_days=[1,3,7]) -> pd.DataFrame:
-    group_keys = ["asin_y4a", "country", "platform"]
-    df = df.sort_values(by=group_keys + ["log_date"])
-    if "unitsold" not in df.columns:
-        df["unitsold"] = np.nan
-    for d in lag_days:
-        df[f"lag_{d}"] = df.groupby(group_keys)["unitsold"].shift(d)
-    return df
-
-CATEGORICAL_FEATURES_LGBM: List[str] = ['asin_y4a', 'country', 'platform', 'master_category', 'super_category', 'main_category', 'category', 'product_line', 'year', 'month', 'day', 'weekday', 'is_weekend', 'is_big_sale']
-
-# -------------------------
-# Load model & data
-# -------------------------
-
 try:
     lgbm = joblib.load(MODEL_PATH)
     FEATURES: List[str] = joblib.load(FEATURES_PATH)
@@ -113,55 +88,118 @@ except Exception as e:
 # Core predict
 # -------------------------
 
-def _safe_category_cast(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    for col in cols:
-        if col in df.columns:
-            df[col] = df[col].astype("category")
+def create_lagged_features(df, lag_days=[1, 3, 7]):
+    # fort data
+    df = df.sort_values(by=['asin_y4a', 'country', 'platform', 'log_date']).reset_index(drop=True)
+    lag_cols = ['y4a_asp', 'y4a_unitsold']
+    for col in lag_cols:
+        for lag in lag_days:
+            new_col_name = f'lag_{col}_{lag}d'
+            # calcu lag
+            df[new_col_name] = df.groupby(['asin_y4a', 'country', 'platform'])[col].shift(lag)
+            df[new_col_name] = df[new_col_name].fillna(-999)
     return df
 
-def predict_unitsold(date, asin_y4a, asp) -> int:
-    print(f"Predicting for {asin_y4a} on {date} with ASP={asp}")
+def create_time_features(df):
+    df['year'] = df['log_date'].dt.year
+    df['month'] = df['log_date'].dt.month
+    df['day'] = df['log_date'].dt.day
+    df['weekday'] = df['log_date'].dt.weekday
+    df['dayofyear'] = df['log_date'].dt.dayofyear
+    df['is_weekend'] = (df['log_date'].dt.weekday >= 5).astype('category')
+    big_sale_ranges = [
+        pd.date_range('2023-10-10', '2023-10-11'),
+        pd.date_range('2022-10-11', '2022-10-12'),
+        pd.date_range('2023-07-11', '2023-07-12'),
+        pd.date_range('2024-07-16', '2024-07-17'),
+        pd.date_range('2024-10-08', '2024-10-09'),
+        pd.date_range('2025-07-08', '2025-07-11'),
+        pd.date_range('2025-10-07', '2025-10-08')
+    ]
+    df['is_big_sale'] = df['log_date'].apply(lambda x: any(x in r for r in big_sale_ranges)).astype('category')
+    return df
+
+def predict_unitsold(date, asin_y4a, asp):
+    """
+    Predict unitsold for a ASIN, day and price ASP.
+
+    Args:
+        date (str or datetime): (YYYY-MM-DD).
+        asin_y4a (str): ASIN.
+        asp (float): price ASP.
+
+    Returns:
+        float: unitsold predict.
+    """
     date = pd.to_datetime(date)
 
+    # Create DataFrame get data from historical data
+    # Get basic infomation of ASIN from history data
+    # Find last row of ASIN/Country/Platform sort by date (day < day_predict)
     last_day_data = historical_df[
-        (historical_df["asin_y4a"] == asin_y4a) &
-        (historical_df["log_date"] < date)
-    ].sort_values(by="log_date", ascending=False).drop_duplicates(
-        subset=["asin_y4a","country","platform"]
+        (historical_df['asin_y4a'] == asin_y4a) &
+        (historical_df['log_date'] < date)
+    ].sort_values(by='log_date', ascending=False).drop_duplicates(
+        subset=['asin_y4a', 'country', 'platform'] # get last row
     )
 
     if last_day_data.empty:
+        print(f"Not found history data of ASIN {asin_y4a} before {date.date()}. Return 0")
         return 0
 
-    drop_cols = {"direct_price_gap","port_price_gap","year","month","day","weekday","dayofyear","is_weekend","y4a_asp"}
-    base_cols = [c for c in FEATURES if not c.startswith("lag_") and c not in drop_cols]
+    # Create DataFrame for predict_date
+    # Keep all columns except the lag feature columns and the columns that will be recalculated
+    base_cols = [col for col in FEATURES if not col.startswith('lag_') and col not in ['direct_price_gap', 'port_price_gap', 'year', 'month', 'day', 'weekday', 'dayofyear', 'is_weekend', 'y4a_asp']]
 
-    predict_df = last_day_data[base_cols].copy()
-    predict_df["log_date"] = date
-    predict_df["y4a_asp"] = asp
+    # Take the base data from the last retrieved row
+    predict_df = last_day_data[base_cols].copy() # Explicitly create a copy
 
-    predict_df = create_time_features(predict_df.copy())
+    # Assign new date and price
+    predict_df['log_date'] = date
+    predict_df['y4a_asp'] = asp # Assign new ASP value
+
+    # Add time-related features for the prediction date
+    predict_df = create_time_features(predict_df.copy()) # Explicitly create a copy
+
+    # Recalculate lagged features
+    # Need to combine historical data and prediction date to compute lag correctly
     combined_df = pd.concat([historical_df, predict_df], ignore_index=True)
-    combined_df = combined_df.sort_values(by=["asin_y4a","country","platform","log_date"]).reset_index(drop=True)
 
-    predict_df_with_lag = create_lagged_features(combined_df.copy(), lag_days=[1,3,7])
-    predict_df = predict_df_with_lag[predict_df_with_lag["log_date"] == date].copy()
+    # Sort to calculate lag correctly
+    combined_df = combined_df.sort_values(by=['asin_y4a', 'country', 'platform', 'log_date']).reset_index(drop=True)
 
-    for col in ["direct_comp_asp","port_comp_asp"]:
-        if col not in predict_df.columns:
-            predict_df[col] = np.nan
+    # Compute lag only for the prediction date (the newly added row)
+    # Filter only rows with log_date equal to the prediction date
+    predict_df_with_lag = create_lagged_features(combined_df.copy(), lag_days=[1, 3, 7]) # Explicitly create a copy and pass to create_lagged_features
+    predict_df = predict_df_with_lag[predict_df_with_lag['log_date'] == date].copy() # Explicitly create a copy
 
-    predict_df["direct_price_gap"] = predict_df["y4a_asp"] - predict_df["direct_comp_asp"].fillna(-999)
-    predict_df["port_price_gap"]  = predict_df["y4a_asp"] - predict_df["port_comp_asp"].fillna(-999)
+    # Recalculate price gaps
+    # Ensure competitor ASP columns are not NaN before calculation
+    predict_df['direct_price_gap'] = predict_df['y4a_asp'] - predict_df['direct_comp_asp'].fillna(-999)
+    predict_df['port_price_gap'] = predict_df['y4a_asp'] - predict_df['port_comp_asp'].fillna(-999)
 
-    X_predict = predict_df[FEATURES].copy()
-    X_predict = _safe_category_cast(X_predict, CATEGORICAL_FEATURES_LGBM)
+    # Apply the same column order as during training
+    X_predict = predict_df[FEATURES].copy() # Explicitly create a copy
+    CATEGORICAL_FEATURES_LGBM = ['asin_y4a', 'country', 'platform', 'master_category', 'super_category', 'main_category', 'category', 'product_line', 'year', 'month', 'day', 'weekday', 'is_weekend', 'is_big_sale']
+    # Ensure categorical columns have the same categories as during training
+    for col in CATEGORICAL_FEATURES_LGBM:
+        if col in X_predict.columns:
+            X_predict[col] = X_predict[col].astype('category')
+            # May need additional handling for new categories appearing in prediction data
+            # that were not present in training data (ignored here for simplicity)
 
+    # print("Data predict: ",X_predict['is_big_sale'])
+    # Make prediction (on log-transformed data)
     y_pred_log = lgbm.predict(X_predict)
-    y_pred = np.expm1(y_pred_log)
-    y_pred[y_pred < 0] = 0
-    return int(y_pred[0])
 
+    # Convert back to actual Unitsold
+    y_pred = np.expm1(y_pred_log)
+
+    # Ensure unitsold is not negative
+    y_pred[y_pred < 0] = 0
+
+    # Return the first predicted value (since predict_df only has one row for that date)
+    return int(y_pred[0])
 # -------------------------
 # Schemas & Routes
 # -------------------------
@@ -193,8 +231,8 @@ def features():
 @app.post("/predict", response_model=PredictOut)
 def predict_endpoint(payload: PredictIn):
     try:
-        from datetime import datetime
-        today = datetime.now().strftime("%Y-%m-%d")
+        from datetime import datetime, timedelta
+        today = (datetime.now()-timedelta(days=1)).strftime("%Y-%m-%d")
         y = predict_unitsold(today, payload.asin_y4a, payload.asp)
         return PredictOut(asin_y4a=payload.asin_y4a, date=today, asp=payload.asp, unitsold=y)
     except Exception as e:
@@ -203,8 +241,9 @@ def predict_endpoint(payload: PredictIn):
 
 @app.post("/predict/batch")
 def predict_batch(payload: BatchPredictIn):
-    from datetime import datetime
-    today = datetime.now().strftime("%Y-%m-%d")
+    from datetime import datetime, timedelta
+    # today = datetime.now().strftime("%Y-%m-%d")
+    today = (datetime.now()-timedelta(days=1)).strftime("%Y-%m-%d")
     out: List[PredictOut] = []
     for item in payload.items:
         try:
